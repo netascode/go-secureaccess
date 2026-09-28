@@ -1,8 +1,8 @@
-[![Tests](https://github.com/netascode/go-secureclient/actions/workflows/test.yml/badge.svg)](https://github.com/netascode/go-secureclient/actions/workflows/test.yml)
+[![Tests](https://github.com/netascode/go-secureaccess/actions/workflows/test.yml/badge.svg)](https://github.com/netascode/go-secureaccess/actions/workflows/test.yml)
 
-# go-secureclient
+# go-secureaccess
 
-`go-secureclient` is a Go client library for Cisco Secure Access
+`go-secureaccess` is a Go client library for Cisco Secure Access
 
 ## Getting Started
 
