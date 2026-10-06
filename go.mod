@@ -3,7 +3,7 @@ module github.com/netascode/go-secureaccess
 go 1.26.6
 
 require (
-	github.com/tidwall/gjson v1.19.0
+	github.com/tidwall/gjson v1.19.1
 	golang.org/x/time v0.16.0
 )
 
