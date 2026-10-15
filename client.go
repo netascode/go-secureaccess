@@ -27,7 +27,6 @@ const (
 	DefaultBackoffMinDelay     int     = 2
 	DefaultBackoffMaxDelay     int     = 60
 	DefaultBackoffDelayFactor  float64 = 3
-	DefaultMaxItems            int     = 100
 	// DefaultRateLimit is the fixed client-side request rate, in requests per
 	// second, applied to every outgoing HTTP request.
 	DefaultRateLimit float64 = 5
@@ -69,8 +68,6 @@ type Client struct {
 
 	// Authentication mutex
 	authenticationMutex *sync.RWMutex
-	// Maximum number of items retrieved in a single GET request
-	maxItems int
 	// configErrs collects validation errors raised by modifiers.
 	configErrs []error
 
@@ -112,12 +109,12 @@ func NewClient(url, key, secret string, mods ...func(*Client)) (Client, error) {
 		backoffMinDelay:     DefaultBackoffMinDelay,
 		backoffMaxDelay:     DefaultBackoffMaxDelay,
 		backoffDelayFactor:  DefaultBackoffDelayFactor,
-		maxItems:            DefaultMaxItems,
 		authenticationMutex: &sync.RWMutex{},
 		readers:             make(chan int),
 		writers:             make(chan int),
 		limiter:             rate.NewLimiter(rate.Limit(DefaultRateLimit), 1),
 	}
+
 	go runModeGate(client.readers, client.writers)
 
 	for _, mod := range mods {
@@ -228,19 +225,6 @@ func BackoffDelayFactor(x float64) func(*Client) {
 	}
 }
 
-// MaxItems modifies the maximum number of items retrieved in a single GET request
-// from the default of 100. It must be > 0.
-func MaxItems(x int) func(*Client) {
-	return func(client *Client) {
-		if x <= 0 {
-			client.configErrs = append(client.configErrs,
-				fmt.Errorf("MaxItems must be > 0, got %d", x))
-			return
-		}
-		client.maxItems = x
-	}
-}
-
 // MaxRateLimitRetries modifies the maximum number of retries after an HTTP 429
 // from the default of 10. A value of 0 disables retrying on 429.
 func MaxRateLimitRetries(x int) func(*Client) {
@@ -316,7 +300,7 @@ func (client *Client) Do(req Req) (Res, error) {
 
 	var res Res
 
-	if req.HttpReq.Method == "DELETE" || req.HttpReq.Method == "POST" || req.HttpReq.Method == "PUT" {
+	if req.HttpReq.Method != "GET" {
 		client.writers <- +1
 		defer func() { client.writers <- -1 }()
 	}
@@ -402,87 +386,43 @@ func (client *Client) do(ctx context.Context, req Req, body []byte) (*http.Respo
 	return client.HttpClient.Do(req.HttpReq)
 }
 
-// Get makes a GET requests and returns a GJSON result.
-// It handles pagination and returns all items in a single response.
+// Get makes a GET request and returns a GJSON result.
+// It does the exact request it is told to do, without pagination.
 func (client *Client) Get(ctx context.Context, path string, mods ...func(*Req)) (Res, error) {
 	client.readers <- 1
 	defer func() { client.readers <- -1 }()
 
-	// Check if path contains 'limit' or 'offset' query parameters.
-	// If so, assume user is doing a paginated request and return the raw data.
-	if hasQueryParam(path, "limit") || hasQueryParam(path, "offset") {
-		return client.get(ctx, path, mods...)
-	}
+	return client.get(ctx, path, mods...)
+}
 
-	// Execute query as provided by user
-	raw, err := client.get(ctx, path, mods...)
-	if err != nil {
-		return raw, err
-	}
+// GetAll makes paginated GET requests and returns all items as a single plain
+// JSON array, using the Paginator registered for the path prefix, see
+// pathPaginator. An empty collection returns []. An error is returned when the
+// items cannot be found in the response.
+func (client *Client) GetAll(ctx context.Context, path string, mods ...func(*Req)) (Res, error) {
+	return client.GetAllWithPaginator(ctx, path, pathPaginator(path), mods...)
+}
 
-	count := raw.Get("count")
-	limit := raw.Get("limit")
+// GetAllWithPaginator is like GetAll, but uses the given Paginator instead of
+// the one registered for the path prefix. A nil Paginator disables pagination:
+// a single request is made and its response must be a plain array, otherwise
+// an error is returned.
+func (client *Client) GetAllWithPaginator(ctx context.Context, path string, paginate Paginator, mods ...func(*Req)) (Res, error) {
+	client.readers <- 1
+	defer func() { client.readers <- -1 }()
 
-	// Pagination data not available, return the raw data as is
-	if !count.Exists() || !limit.Exists() {
-		return raw, nil
-	}
-
-	// All items are already returned in a single response, return the raw data as is
-	if count.Int() <= limit.Int() {
-		return raw, nil
-	}
-
-	log.Printf("[DEBUG] Paginated response detected")
-
-	// Generate Request ID for tracking all get requests under a single ID
-	reqID := generateRequestID(8)
-	mods = append(mods, RequestID(reqID))
-
-	// Build the merged response in a single pass
-	var sb strings.Builder
-	sb.WriteString(`{"results":[`)
-	first := true
-	offset := 0
-	for {
-		// Get URL path with offset and limit set
-		urlPath := pathWithOffset(path, offset, client.maxItems)
-
-		// Execute query
-		raw, err := client.get(ctx, urlPath, mods...)
+	if paginate == nil {
+		res, err := client.get(ctx, path, mods...)
 		if err != nil {
-			return raw, err
+			return res, err
 		}
-
-		// Check if there are any items in the response.
-		results := raw.Get("results")
-		if !results.IsArray() {
-			if results.Exists() {
-				log.Printf("[DEBUG] [ReqID: %s] Ignoring non-array 'results' field (type %s) at offset %d", reqID, results.Type, offset)
-			}
-			break
+		if !res.IsArray() {
+			return res, fmt.Errorf("unexpected non-array response (type %s)", res.Type)
 		}
-
-		// Strip surrounding square brackets and append items directly.
-		if chunk := strings.TrimSpace(results.Raw[1 : len(results.Raw)-1]); chunk != "" {
-			if !first {
-				sb.WriteByte(',')
-			}
-			sb.WriteString(chunk)
-			first = false
-		}
-
-		// If there are no more pages, stop reading
-		if count.Int() <= int64(offset+client.maxItems) {
-			break
-		}
-
-		// Increase offset to get next bulk of data
-		offset += client.maxItems
+		return res, nil
 	}
 
-	sb.WriteString(`]}`)
-	return gjson.Parse(sb.String()), nil
+	return paginate(ctx, client, path, mods...)
 }
 
 // get makes a GET request and returns a GJSON result.

@@ -76,13 +76,18 @@ func pathWithOffset(path string, offset, limit int) string {
 	return u.String()
 }
 
-// hasQueryParam reports whether path carries the named query parameter.
-func hasQueryParam(path, param string) bool {
+// pathWithPage returns path with the page and limit query parameters set,
+// replacing them if they are already present.
+func pathWithPage(path string, page, limit int) string {
 	u, err := url.Parse(path)
 	if err != nil {
-		return false
+		return path
 	}
 
-	_, ok := u.Query()[param]
-	return ok
+	q := u.Query()
+	q.Set("page", strconv.Itoa(page))
+	q.Set("limit", strconv.Itoa(limit))
+	u.RawQuery = q.Encode()
+
+	return u.String()
 }
