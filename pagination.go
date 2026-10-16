@@ -19,10 +19,13 @@ type Paginator func(ctx context.Context, client *Client, path string, mods ...fu
 // longest matching prefix wins. The empty prefix matches every path and sets
 // the default.
 var pathPaginators = map[string]Paginator{
-	"/policies/v2/":                 OffsetLimitListPagination,
-	"/policies/v2/objects/":         OffsetLimitKeyedPagination,
-	"/policies/v2/destinationlists": PageLimitKeyedPagination,
-	"":                              OffsetLimitKeyedPagination,
+	"/policies/v2/":                                      OffsetLimitListPagination,
+	"/policies/v2/objects/":                              OffsetLimitKeyedPagination,
+	"/policies/v2/privateResourceGroups":                 OffsetLimitKeyedPagination,
+	"/policies/v2/destinationlists":                      PageLimitKeyedPagination,
+	"/policies/v2/applicationCategories":                 PageLimitMapPagination,
+	"/policies/v2/applicationCategories?optionalFields=": PageLimitListPagination,
+	"": OffsetLimitKeyedPagination,
 }
 
 // pathPaginator returns the Paginator registered for the longest prefix of
@@ -40,7 +43,7 @@ func pathPaginator(path string) Paginator {
 
 // itemKeys lists the top-level fields that may carry the items in keyed
 // paginator responses, in detection order.
-var itemKeys = []string{"results", "data"}
+var itemKeys = []string{"results", "data", "items"}
 
 // itemsKey returns the first of itemKeys holding an array in res, or "" if
 // none does.
@@ -273,6 +276,125 @@ func PageLimitKeyedPagination(ctx context.Context, client *Client, path string, 
 		// A short or empty page, or reaching the total, ends the collection
 		total := raw.Get("meta.total")
 		if n < maxItems || (total.Exists() && collected >= total.Int()) {
+			break
+		}
+
+		log.Printf("[DEBUG] [ReqID: %s] Full page %d, requesting next page", reqID, page)
+	}
+
+	sb.WriteByte(']')
+	return gjson.Parse(sb.String()), nil
+}
+
+// PageLimitMapPagination is a Paginator for responses that are a JSON object
+// mapping item IDs to items, without any paging metadata. It requests pages of
+// maxItems items with the page and limit query parameters, starting at page 1,
+// until a page returns fewer than maxItems items or an empty object or array,
+// and merges the item values, in response order, into a single plain array.
+// Any other response returns an error.
+func PageLimitMapPagination(ctx context.Context, client *Client, path string, mods ...func(*Req)) (Res, error) {
+	// Maximum number of items retrieved in a single page request
+	const maxItems = 100
+
+	// Generate Request ID for tracking all get requests under a single ID
+	reqID := generateRequestID(8)
+	mods = append(mods, RequestID(reqID))
+
+	// Build the merged response in a single pass
+	var sb strings.Builder
+	sb.WriteByte('[')
+	first := true
+	for page := 1; ; page++ {
+		// Get URL path with page and limit set
+		urlPath := pathWithPage(path, page, maxItems)
+
+		// Execute query
+		raw, err := client.get(ctx, urlPath, mods...)
+		if err != nil {
+			return raw, err
+		}
+
+		// An empty list means there are no more items
+		if raw.IsArray() && len(raw.Array()) == 0 {
+			break
+		}
+
+		if !raw.IsObject() {
+			return raw, fmt.Errorf("unexpected non-object response (type %s) on page %d", raw.Type, page)
+		}
+
+		// Append the map values, dropping their keys
+		n := 0
+		raw.ForEach(func(_, item gjson.Result) bool {
+			if !first {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(item.Raw)
+			first = false
+			n++
+			return true
+		})
+
+		// A short or empty page is the last one
+		if n < maxItems {
+			break
+		}
+
+		log.Printf("[DEBUG] [ReqID: %s] Full page %d, requesting next page", reqID, page)
+	}
+
+	sb.WriteByte(']')
+	return gjson.Parse(sb.String()), nil
+}
+
+// PageLimitListPagination is a Paginator for responses that are a plain JSON
+// array of items, without any paging metadata. It requests pages of maxItems
+// items with the page and limit query parameters, starting at page 1, until a
+// page returns fewer than maxItems items, and merges them into a single array.
+// A non-array response returns an error.
+func PageLimitListPagination(ctx context.Context, client *Client, path string, mods ...func(*Req)) (Res, error) {
+	// Maximum number of items retrieved in a single page request
+	const maxItems = 100
+
+	// Generate Request ID for tracking all get requests under a single ID
+	reqID := generateRequestID(8)
+	mods = append(mods, RequestID(reqID))
+
+	// Build the merged response in a single pass
+	var sb strings.Builder
+	sb.WriteByte('[')
+	first := true
+	for page := 1; ; page++ {
+		// Get URL path with page and limit set
+		urlPath := pathWithPage(path, page, maxItems)
+
+		// Execute query
+		raw, err := client.get(ctx, urlPath, mods...)
+		if err != nil {
+			return raw, err
+		}
+
+		if !raw.IsArray() {
+			return raw, fmt.Errorf("unexpected non-array response (type %s) on page %d", raw.Type, page)
+		}
+
+		items := 0
+		raw.ForEach(func(_, _ gjson.Result) bool {
+			items++
+			return true
+		})
+
+		// Strip surrounding square brackets and append items directly.
+		if items > 0 {
+			if !first {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(strings.TrimSpace(raw.Raw[1 : len(raw.Raw)-1]))
+			first = false
+		}
+
+		// A short or empty page is the last one
+		if items < maxItems {
 			break
 		}
 

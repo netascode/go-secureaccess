@@ -79,6 +79,10 @@ type Client struct {
 	// second. It is shared by all goroutines using this client, and applies to
 	// authentication and to every retry attempt as well.
 	limiter *rate.Limiter
+
+	// reports holds the Reports API prefix discovered by the first successful
+	// /reports request. It is shared by all copies of this client.
+	reports *reportsPrefix
 }
 
 // NewClient creates a new Secure Access HTTP client.
@@ -113,6 +117,7 @@ func NewClient(url, key, secret string, mods ...func(*Client)) (Client, error) {
 		readers:             make(chan int),
 		writers:             make(chan int),
 		limiter:             rate.NewLimiter(rate.Limit(DefaultRateLimit), 1),
+		reports:             &reportsPrefix{},
 	}
 
 	go runModeGate(client.readers, client.writers)
@@ -285,9 +290,6 @@ func (client *Client) Do(req Req) (Res, error) {
 		return Res{}, err
 	}
 
-	// Save current auth token. In case of 401, we can check if the token has changed in the meantime
-	accessToken := client.AccessToken()
-	req.HttpReq.Header.Set("Authorization", "Bearer "+accessToken)
 	req.HttpReq.Header.Add("Content-Type", "application/json")
 	req.HttpReq.Header.Add("Accept", "application/json")
 	req.HttpReq.Header.Add("User-Agent", client.userAgent)
@@ -298,12 +300,29 @@ func (client *Client) Do(req Req) (Res, error) {
 		body, _ = io.ReadAll(req.HttpReq.Body)
 	}
 
-	var res Res
-
 	if req.HttpReq.Method != "GET" {
 		client.writers <- +1
 		defer func() { client.writers <- -1 }()
 	}
+
+	if isReportsPath(req.HttpReq.URL.Path) {
+		return client.doReports(ctx, req, body)
+	}
+
+	res, _, err := client.doWithRetries(ctx, req, body)
+	return res, err
+}
+
+// doWithRetries sends the request, retrying and reauthenticating as needed.
+// It also returns the HTTP status code of the last response, or 0 if no
+// response was received.
+func (client *Client) doWithRetries(ctx context.Context, req Req, body []byte) (Res, int, error) {
+	// Save current auth token. In case of 401, we can check if the token has changed in the meantime
+	accessToken := client.AccessToken()
+	req.HttpReq.Header.Set("Authorization", "Bearer "+accessToken)
+
+	var res Res
+	var statusCode int
 
 	for attempts := 0; ; attempts++ {
 		httpRes, err := client.do(ctx, req, body)
@@ -311,7 +330,7 @@ func (client *Client) Do(req Req) (Res, error) {
 			if ok := client.Backoff(ctx, attempts); !ok {
 				log.Printf("[ERROR] [ReqID: %s] HTTP Connection error occurred: %+v", req.RequestID, err)
 				log.Printf("[DEBUG] [ReqID: %s] Exit from Do method", req.RequestID)
-				return Res{}, err
+				return Res{}, 0, err
 			} else {
 				log.Printf("[ERROR] [ReqID: %s] HTTP Connection failed: %s, retries: %v", req.RequestID, err, attempts)
 				continue
@@ -324,13 +343,14 @@ func (client *Client) Do(req Req) (Res, error) {
 			if ok := client.Backoff(ctx, attempts); !ok {
 				log.Printf("[ERROR] [ReqID: %s] Cannot decode response body: %+v", req.RequestID, err)
 				log.Printf("[DEBUG] [ReqID: %s] Exit from Do method", req.RequestID)
-				return Res{}, err
+				return Res{}, 0, err
 			} else {
 				log.Printf("[ERROR] [ReqID: %s] Cannot decode response body: %s, retries: %v", req.RequestID, err, attempts)
 				continue
 			}
 		}
 		res = gjson.ParseBytes(bodyBytes)
+		statusCode = httpRes.StatusCode
 		log.Printf("[DEBUG] [ReqID: %s] HTTP Response Headers (StatusCode %d): %s", req.RequestID, httpRes.StatusCode, formatHeaders(httpRes.Header))
 		if req.LogPayload {
 			log.Printf("[DEBUG] [ReqID: %s] HTTP Response (StatusCode %d): %s", req.RequestID, httpRes.StatusCode, res.Raw)
@@ -343,7 +363,7 @@ func (client *Client) Do(req Req) (Res, error) {
 			if ok := client.Backoff(ctx, attempts); !ok {
 				log.Printf("[ERROR] [ReqID: %s] HTTP Request failed: StatusCode %v", req.RequestID, httpRes.StatusCode)
 				log.Printf("[DEBUG] [ReqID: %s] Exit from Do method", req.RequestID)
-				return res, fmt.Errorf("HTTP Request failed: StatusCode %v", httpRes.StatusCode)
+				return res, httpRes.StatusCode, fmt.Errorf("HTTP Request failed: StatusCode %v", httpRes.StatusCode)
 			} else if httpRes.StatusCode >= 500 && httpRes.StatusCode <= 599 {
 				log.Printf("[ERROR] [ReqID: %s] HTTP Request failed: StatusCode %v, Retries: %v", req.RequestID, httpRes.StatusCode, attempts)
 				continue
@@ -353,7 +373,7 @@ func (client *Client) Do(req Req) (Res, error) {
 				err := client.Authenticate(ctx, accessToken)
 				if err != nil {
 					log.Printf("[DEBUG] [ReqID: %s] HTTP Request failed: StatusCode 401: Reauthentication failed with StatusCode (%d): %s", req.RequestID, httpRes.StatusCode, err.Error())
-					return res, fmt.Errorf("HTTP Request failed: StatusCode 401: Reauthentication failed with StatusCode (%d): %s", httpRes.StatusCode, err.Error())
+					return res, httpRes.StatusCode, fmt.Errorf("HTTP Request failed: StatusCode 401: Reauthentication failed with StatusCode (%d): %s", httpRes.StatusCode, err.Error())
 				}
 				// Save authentication token in case next 401 is received
 				accessToken = client.AccessToken()
@@ -363,11 +383,11 @@ func (client *Client) Do(req Req) (Res, error) {
 			// In case any previous conditions don't `continue`, return error
 			log.Printf("[ERROR] [ReqID: %s] HTTP Request failed: StatusCode %v", req.RequestID, httpRes.StatusCode)
 			log.Printf("[DEBUG] [ReqID: %s] Exit from Do method", req.RequestID)
-			return res, fmt.Errorf("HTTP Request failed: StatusCode %v", httpRes.StatusCode)
+			return res, httpRes.StatusCode, fmt.Errorf("HTTP Request failed: StatusCode %v", httpRes.StatusCode)
 		}
 	}
 
-	return res, nil
+	return res, statusCode, nil
 }
 
 func (client *Client) do(ctx context.Context, req Req, body []byte) (*http.Response, error) {
