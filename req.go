@@ -6,11 +6,11 @@ import (
 
 // Req wraps http.Request for API requests.
 type Req struct {
-	// HttpReq is the *http.Request obejct.
+	// HttpReq is the *http.Request object.
 	HttpReq *http.Request
 	// LogPayload indicates whether logging of payloads should be enabled.
 	LogPayload bool
-	// ID for the request.
+	// RequestID carries the unique identifier for the request.
 	RequestID string
 }
 
@@ -19,7 +19,7 @@ func NoLogPayload(req *Req) {
 	req.LogPayload = false
 }
 
-// Set request ID
+// RequestID sets the unique identifier for the request.
 func RequestID(x string) func(*Req) {
 	return func(req *Req) {
 		req.RequestID = x

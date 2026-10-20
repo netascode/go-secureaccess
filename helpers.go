@@ -62,10 +62,10 @@ func isRetryableStatus(code int) bool {
 
 // pathWithOffset returns path with the offset and limit query parameters set,
 // replacing them if they are already present.
-func pathWithOffset(path string, offset, limit int) string {
+func pathWithOffset(path string, offset, limit int) (string, error) {
 	u, err := url.Parse(path)
 	if err != nil {
-		return path
+		return path, err
 	}
 
 	q := u.Query()
@@ -73,15 +73,15 @@ func pathWithOffset(path string, offset, limit int) string {
 	q.Set("limit", strconv.Itoa(limit))
 	u.RawQuery = q.Encode()
 
-	return u.String()
+	return u.String(), nil
 }
 
 // pathWithPage returns path with the page and limit query parameters set,
 // replacing them if they are already present.
-func pathWithPage(path string, page, limit int) string {
+func pathWithPage(path string, page, limit int) (string, error) {
 	u, err := url.Parse(path)
 	if err != nil {
-		return path
+		return path, err
 	}
 
 	q := u.Query()
@@ -89,5 +89,5 @@ func pathWithPage(path string, page, limit int) string {
 	q.Set("limit", strconv.Itoa(limit))
 	u.RawQuery = q.Encode()
 
-	return u.String()
+	return u.String(), nil
 }

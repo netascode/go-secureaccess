@@ -45,7 +45,7 @@ func newTestClient(t *testing.T, url string) *Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &client
+	return client
 }
 
 func equalPaths(a, b []string) bool {

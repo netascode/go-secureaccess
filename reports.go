@@ -49,7 +49,7 @@ func (client *Client) doReports(ctx context.Context, req Req, body []byte) (Res,
 	if prefix != "" {
 		client.reports.mu.Unlock()
 		setReportsPrefix(req, path, rawPath, prefix)
-		res, _, err := client.doWithRetries(ctx, req, body)
+		res, err := client.doWithRetries(ctx, req, body)
 		return res, err
 	}
 	defer client.reports.mu.Unlock()
@@ -59,14 +59,13 @@ func (client *Client) doReports(ctx context.Context, req Req, body []byte) (Res,
 	for _, prefix := range reportsPrefixes {
 		setReportsPrefix(req, path, rawPath, prefix)
 		log.Printf("[DEBUG] [ReqID: %s] Trying Reports API prefix %s", req.RequestID, prefix)
-		var statusCode int
-		res, statusCode, err = client.doWithRetries(ctx, req, body)
+		res, err = client.doWithRetries(ctx, req, body)
 		if err == nil {
 			log.Printf("[DEBUG] [ReqID: %s] Using Reports API prefix %s", req.RequestID, prefix)
 			client.reports.prefix = prefix
 			return res, nil
 		}
-		if statusCode != http.StatusForbidden {
+		if res.StatusCode != http.StatusForbidden {
 			return res, err
 		}
 	}

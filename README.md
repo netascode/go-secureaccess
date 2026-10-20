@@ -19,12 +19,26 @@ To start using `go-secureaccess`, install Go and `go get`:
 ```go
 package main
 
-import "github.com/netascode/go-secureaccess"
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"github.com/netascode/go-secureaccess"
+)
 
 func main() {
-    client, _ := fmc.NewClient("https://api.sse.cisco.com", "apiKey", "apiKeySecret")
+	client, err := secureaccess.NewClient("https://api.sse.cisco.com", "apiKey", "apiKeySecret")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	ctx := context.Background()
 	res, err := client.Get(ctx, "/policies/v2/objects/networkObjects")
-    println(res.Get("results.0.name").String())
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(res.Get("results.0.name").String())
 }
 ```
 

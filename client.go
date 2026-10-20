@@ -12,7 +12,6 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
-	"net/http/cookiejar"
 	"strings"
 	"sync"
 	"time"
@@ -33,8 +32,9 @@ const (
 )
 
 // Client is an HTTP Secure Access client.
-// Use secureaccess.NewClient to initiate a client.
-// This will ensure proper cookie handling and processing of modifiers.
+// Use secureaccess.NewClient to initiate a client. A Client is safe for
+// concurrent use and must not be copied: share the *Client returned by
+// NewClient instead.
 type Client struct {
 	// HttpClient is the *http.Client used for API requests.
 	HttpClient *http.Client
@@ -44,8 +44,6 @@ type Client struct {
 	key string
 	// secret is the Secure Access API secret
 	secret string
-	// orgID is the Multi-org and Managed Child Organizations ID
-	orgID string
 	// accessToken is the current access token
 	accessToken string
 	// userAgent is the HTTP User-Agent string
@@ -64,10 +62,12 @@ type Client struct {
 	// Backoff delay factor
 	backoffDelayFactor float64
 	// expirationTime is the timestamp of the authentication token expiration
-	expirationTime time.Time
+	// Token expiration time is one hour by default. Not tracking this explicitly.
+	// Refresh will happen after failed request
+	// expirationTime time.Time
 
-	// Authentication mutex
-	authenticationMutex *sync.RWMutex
+	// authenticationMutex makes sure that authentication-related operations are properly synchronized.
+	authenticationMutex sync.RWMutex
 	// configErrs collects validation errors raised by modifiers.
 	configErrs []error
 
@@ -81,7 +81,7 @@ type Client struct {
 	limiter *rate.Limiter
 
 	// reports holds the Reports API prefix discovered by the first successful
-	// /reports request. It is shared by all copies of this client.
+	// /reports request.
 	reports *reportsPrefix
 }
 
@@ -89,22 +89,19 @@ type Client struct {
 // Pass modifiers in to modify the behavior of the client, e.g.
 //
 //	client, _ := NewClient("https://api.sse.cisco.com", "key", "secret", RequestTimeout(120*time.Second), MaxRetries(5))
-func NewClient(url, key, secret string, mods ...func(*Client)) (Client, error) {
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
-		Proxy:           http.ProxyFromEnvironment,
-	}
+func NewClient(url, key, secret string, mods ...func(*Client)) (*Client, error) {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: false}
+	tr.Proxy = http.ProxyFromEnvironment
 
-	cookieJar, _ := cookiejar.New(nil)
 	httpClient := http.Client{
 		Timeout:   60 * time.Second,
 		Transport: tr,
-		Jar:       cookieJar,
 	}
 
-	client := Client{
+	client := &Client{
 		HttpClient:          &httpClient,
-		url:                 url,
+		url:                 strings.TrimRight(url, "/"),
 		userAgent:           "go-secureaccess netascode",
 		key:                 key,
 		secret:              secret,
@@ -113,18 +110,18 @@ func NewClient(url, key, secret string, mods ...func(*Client)) (Client, error) {
 		backoffMinDelay:     DefaultBackoffMinDelay,
 		backoffMaxDelay:     DefaultBackoffMaxDelay,
 		backoffDelayFactor:  DefaultBackoffDelayFactor,
-		authenticationMutex: &sync.RWMutex{},
 		readers:             make(chan int),
 		writers:             make(chan int),
 		limiter:             rate.NewLimiter(rate.Limit(DefaultRateLimit), 1),
 		reports:             &reportsPrefix{},
 	}
 
-	go runModeGate(client.readers, client.writers)
-
+	// Apply all modifiers to the client before performing cross-field validation.
 	for _, mod := range mods {
-		mod(&client)
+		mod(client)
 	}
+
+	go runModeGate(client.readers, client.writers)
 
 	// Cross-field validation.
 	if client.backoffMinDelay > client.backoffMaxDelay {
@@ -136,7 +133,7 @@ func NewClient(url, key, secret string, mods ...func(*Client)) (Client, error) {
 	if len(client.configErrs) > 0 {
 		errs := errors.Join(client.configErrs...)
 		client.configErrs = nil
-		return client, fmt.Errorf("invalid client configuration: %w", errs)
+		return nil, fmt.Errorf("invalid client configuration: %w", errs)
 	}
 
 	return client, nil
@@ -146,20 +143,6 @@ func NewClient(url, key, secret string, mods ...func(*Client)) (Client, error) {
 func CustomHttpClient(httpClient *http.Client) func(*Client) {
 	return func(client *Client) {
 		client.HttpClient = httpClient
-	}
-}
-
-// UserAgent modifies the HTTP user agent string. Default value is 'go-secureaccess netascode'.
-func UserAgent(x string) func(*Client) {
-	return func(client *Client) {
-		client.userAgent = x
-	}
-}
-
-// OrgId modifies the organization ID.
-func OrgId(x string) func(*Client) {
-	return func(client *Client) {
-		client.orgID = x
 	}
 }
 
@@ -174,6 +157,13 @@ func Insecure(x bool) func(*Client) {
 func RequestTimeout(x time.Duration) func(*Client) {
 	return func(client *Client) {
 		client.HttpClient.Timeout = x
+	}
+}
+
+// UserAgent modifies the HTTP user agent string. Default value is 'go-secureaccess netascode'.
+func UserAgent(x string) func(*Client) {
+	return func(client *Client) {
+		client.userAgent = x
 	}
 }
 
@@ -300,7 +290,7 @@ func (client *Client) Do(req Req) (Res, error) {
 		body, _ = io.ReadAll(req.HttpReq.Body)
 	}
 
-	if req.HttpReq.Method != "GET" {
+	if req.HttpReq.Method != http.MethodGet {
 		client.writers <- +1
 		defer func() { client.writers <- -1 }()
 	}
@@ -309,28 +299,27 @@ func (client *Client) Do(req Req) (Res, error) {
 		return client.doReports(ctx, req, body)
 	}
 
-	res, _, err := client.doWithRetries(ctx, req, body)
+	res, err := client.doWithRetries(ctx, req, body)
 	return res, err
 }
 
 // doWithRetries sends the request, retrying and reauthenticating as needed.
-// It also returns the HTTP status code of the last response, or 0 if no
-// response was received.
-func (client *Client) doWithRetries(ctx context.Context, req Req, body []byte) (Res, int, error) {
+// The returned Res carries the HTTP status code of the last response in
+// StatusCode, or 0 if no response was received.
+func (client *Client) doWithRetries(ctx context.Context, req Req, body []byte) (Res, error) {
 	// Save current auth token. In case of 401, we can check if the token has changed in the meantime
 	accessToken := client.AccessToken()
 	req.HttpReq.Header.Set("Authorization", "Bearer "+accessToken)
 
 	var res Res
-	var statusCode int
 
 	for attempts := 0; ; attempts++ {
 		httpRes, err := client.do(ctx, req, body)
 		if err != nil {
-			if ok := client.Backoff(ctx, attempts); !ok {
+			if ok := client.backoff(ctx, attempts); !ok {
 				log.Printf("[ERROR] [ReqID: %s] HTTP Connection error occurred: %+v", req.RequestID, err)
 				log.Printf("[DEBUG] [ReqID: %s] Exit from Do method", req.RequestID)
-				return Res{}, 0, err
+				return Res{}, err
 			} else {
 				log.Printf("[ERROR] [ReqID: %s] HTTP Connection failed: %s, retries: %v", req.RequestID, err, attempts)
 				continue
@@ -340,17 +329,17 @@ func (client *Client) doWithRetries(ctx context.Context, req Req, body []byte) (
 		bodyBytes, err := io.ReadAll(httpRes.Body)
 		httpRes.Body.Close()
 		if err != nil {
-			if ok := client.Backoff(ctx, attempts); !ok {
+			if ok := client.backoff(ctx, attempts); !ok {
 				log.Printf("[ERROR] [ReqID: %s] Cannot decode response body: %+v", req.RequestID, err)
 				log.Printf("[DEBUG] [ReqID: %s] Exit from Do method", req.RequestID)
-				return Res{}, 0, err
+				return Res{}, err
 			} else {
 				log.Printf("[ERROR] [ReqID: %s] Cannot decode response body: %s, retries: %v", req.RequestID, err, attempts)
 				continue
 			}
 		}
-		res = gjson.ParseBytes(bodyBytes)
-		statusCode = httpRes.StatusCode
+		res = Res{Result: gjson.ParseBytes(bodyBytes)}
+		res.StatusCode = httpRes.StatusCode
 		log.Printf("[DEBUG] [ReqID: %s] HTTP Response Headers (StatusCode %d): %s", req.RequestID, httpRes.StatusCode, formatHeaders(httpRes.Header))
 		if req.LogPayload {
 			log.Printf("[DEBUG] [ReqID: %s] HTTP Response (StatusCode %d): %s", req.RequestID, httpRes.StatusCode, res.Raw)
@@ -360,10 +349,10 @@ func (client *Client) doWithRetries(ctx context.Context, req Req, body []byte) (
 			log.Printf("[DEBUG] [ReqID: %s] Exit from Do method", req.RequestID)
 			break
 		} else {
-			if ok := client.Backoff(ctx, attempts); !ok {
+			if ok := client.backoff(ctx, attempts); !ok {
 				log.Printf("[ERROR] [ReqID: %s] HTTP Request failed: StatusCode %v", req.RequestID, httpRes.StatusCode)
 				log.Printf("[DEBUG] [ReqID: %s] Exit from Do method", req.RequestID)
-				return res, httpRes.StatusCode, fmt.Errorf("HTTP Request failed: StatusCode %v", httpRes.StatusCode)
+				return res, fmt.Errorf("HTTP Request failed: StatusCode %v", httpRes.StatusCode)
 			} else if httpRes.StatusCode >= 500 && httpRes.StatusCode <= 599 {
 				log.Printf("[ERROR] [ReqID: %s] HTTP Request failed: StatusCode %v, Retries: %v", req.RequestID, httpRes.StatusCode, attempts)
 				continue
@@ -373,7 +362,7 @@ func (client *Client) doWithRetries(ctx context.Context, req Req, body []byte) (
 				err := client.Authenticate(ctx, accessToken)
 				if err != nil {
 					log.Printf("[DEBUG] [ReqID: %s] HTTP Request failed: StatusCode 401: Reauthentication failed with StatusCode (%d): %s", req.RequestID, httpRes.StatusCode, err.Error())
-					return res, httpRes.StatusCode, fmt.Errorf("HTTP Request failed: StatusCode 401: Reauthentication failed with StatusCode (%d): %s", httpRes.StatusCode, err.Error())
+					return res, fmt.Errorf("HTTP Request failed: StatusCode 401: Reauthentication failed with StatusCode (%d): %s", httpRes.StatusCode, err.Error())
 				}
 				// Save authentication token in case next 401 is received
 				accessToken = client.AccessToken()
@@ -383,11 +372,11 @@ func (client *Client) doWithRetries(ctx context.Context, req Req, body []byte) (
 			// In case any previous conditions don't `continue`, return error
 			log.Printf("[ERROR] [ReqID: %s] HTTP Request failed: StatusCode %v", req.RequestID, httpRes.StatusCode)
 			log.Printf("[DEBUG] [ReqID: %s] Exit from Do method", req.RequestID)
-			return res, httpRes.StatusCode, fmt.Errorf("HTTP Request failed: StatusCode %v", httpRes.StatusCode)
+			return res, fmt.Errorf("HTTP Request failed: StatusCode %v", httpRes.StatusCode)
 		}
 	}
 
-	return res, statusCode, nil
+	return res, nil
 }
 
 func (client *Client) do(ctx context.Context, req Req, body []byte) (*http.Response, error) {
@@ -401,7 +390,6 @@ func (client *Client) do(ctx context.Context, req Req, body []byte) (*http.Respo
 	} else {
 		log.Printf("[DEBUG] [ReqID: %s] HTTP Request: %s, %s", req.RequestID, req.HttpReq.Method, req.HttpReq.URL)
 	}
-	log.Printf("[DEBUG] [ReqID: %s] HTTP Request Headers: %s", req.RequestID, formatHeaders(req.HttpReq.Header))
 
 	return client.HttpClient.Do(req.HttpReq)
 }
@@ -465,7 +453,7 @@ func (client *Client) Delete(ctx context.Context, path string, mods ...func(*Req
 	return client.Do(req)
 }
 
-// Delete makes a DELETE request.
+// DeleteWithBody makes a DELETE request with a request body.
 func (client *Client) DeleteWithBody(ctx context.Context, path, data string, mods ...func(*Req)) (Res, error) {
 	req, err := client.NewReq(ctx, "DELETE", path, strings.NewReader(data), mods...)
 	if err != nil {
@@ -475,7 +463,6 @@ func (client *Client) DeleteWithBody(ctx context.Context, path, data string, mod
 }
 
 // Post makes a POST request and returns a GJSON result.
-// Hint: Use the Body struct to easily create POST body data.
 func (client *Client) Post(ctx context.Context, path, data string, mods ...func(*Req)) (Res, error) {
 	req, err := client.NewReq(ctx, "POST", path, strings.NewReader(data), mods...)
 	if err != nil {
@@ -485,7 +472,6 @@ func (client *Client) Post(ctx context.Context, path, data string, mods ...func(
 }
 
 // Put makes a PUT request and returns a GJSON result.
-// Hint: Use the Body struct to easily create PUT body data.
 func (client *Client) Put(ctx context.Context, path, data string, mods ...func(*Req)) (Res, error) {
 	req, err := client.NewReq(ctx, "PUT", path, strings.NewReader(data), mods...)
 	if err != nil {
@@ -495,7 +481,6 @@ func (client *Client) Put(ctx context.Context, path, data string, mods ...func(*
 }
 
 // Patch makes a PATCH request and returns a GJSON result.
-// Hint: Use the Body struct to easily create PATCH body data.
 func (client *Client) Patch(ctx context.Context, path, data string, mods ...func(*Req)) (Res, error) {
 	req, err := client.NewReq(ctx, "PATCH", path, strings.NewReader(data), mods...)
 	if err != nil {
@@ -533,17 +518,18 @@ func (client *Client) Authenticate(ctx context.Context, currentAccessToken strin
 
 	// No accessToken - login
 	for attempts := 0; ; attempts++ {
-		req, err := client.NewReq(ctx, "POST", "/auth/v2/token", strings.NewReader(""), NoLogPayload)
+		// The body is rebuilt on every attempt, a reader cannot be replayed once consumed.
+		body := strings.NewReader("grant_type=client_credentials")
+		req, err := client.NewReq(ctx, "POST", "/auth/v2/token", body, NoLogPayload)
 		if err != nil {
 			// A malformed request is deterministic, retrying cannot help.
 			log.Printf("[ERROR] Authentication failed: %v", err)
 			return err
 		}
-		req.HttpReq.Header.Add("User-Agent", client.userAgent)
+		req.HttpReq.Header.Set("User-Agent", client.userAgent)
+		req.HttpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.HttpReq.Header.Set("Accept", "application/json")
 		req.HttpReq.SetBasicAuth(client.key, client.secret)
-		if client.orgID != "" {
-			req.HttpReq.Header.Add("X-Umbrella-OrgId", client.orgID)
-		}
 
 		if err := client.limiter.Wait(ctx); err != nil {
 			return fmt.Errorf("rate limiter: %w", err)
@@ -559,13 +545,17 @@ func (client *Client) Authenticate(ctx context.Context, currentAccessToken strin
 		if httpRes.StatusCode == 200 {
 			bodyJson := gjson.ParseBytes(bodyBytes)
 			client.accessToken = bodyJson.Get("access_token").String()
-			client.expirationTime = time.Now().Add(time.Duration(bodyJson.Get("expires_in").Int()) * time.Second)
+			if client.accessToken == "" {
+				return fmt.Errorf("authentication failed: access token not found in response")
+			}
+			// Token expiration time is one hour by default. Not tracking this explicitly. Refresh will happen after failed request
+			// client.expirationTime = time.Now().Add(time.Duration(bodyJson.Get("expires_in").Int()) * time.Second)
 			log.Printf("[DEBUG] Authentication successful")
 			return nil
 		}
 
 		// Only rate limiting (429) and server-side errors (5xx) are worth retrying.
-		if isRetryableStatus(httpRes.StatusCode) && client.Backoff(ctx, attempts) {
+		if isRetryableStatus(httpRes.StatusCode) && client.backoff(ctx, attempts) {
 			log.Printf("[ERROR] Authentication failed: StatusCode %v, retries: %v, response body: %s", httpRes.StatusCode, attempts, string(bodyBytes))
 			continue
 		}
@@ -580,10 +570,10 @@ func (client *Client) Authenticate(ctx context.Context, currentAccessToken strin
 	}
 }
 
-// Backoff waits following an exponential backoff algorithm.
+// backoff waits following an exponential backoff algorithm.
 // It reports whether the caller should retry: false means the retry budget is
 // exhausted, or ctx was cancelled before or during the wait.
-func (client *Client) Backoff(ctx context.Context, attempts int) bool {
+func (client *Client) backoff(ctx context.Context, attempts int) bool {
 	log.Printf("[DEBUG] Beginning backoff method: attempt %v of %v", attempts, client.maxRetries)
 	if attempts >= client.maxRetries {
 		log.Printf("[DEBUG] Exit from backoff method with return value false")
