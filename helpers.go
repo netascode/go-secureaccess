@@ -1,12 +1,14 @@
 package secureaccess
 
 import (
+	"context"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // sensitiveHeaders are never logged in full; their values are replaced with a
@@ -45,7 +47,7 @@ func formatHeaders(h http.Header) string {
 	return strings.Join(parts, " | ")
 }
 
-// generate random string
+// generateRequestID generates a random string of the specified length.
 func generateRequestID(length int) string {
 	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 	b := make([]byte, length)
@@ -90,4 +92,43 @@ func pathWithPage(path string, page, limit int) (string, error) {
 	u.RawQuery = q.Encode()
 
 	return u.String(), nil
+}
+
+// retryAfter parses the Retry-After header, given either as delay-seconds or as
+// an HTTP-date. It reports false if the header is missing or malformed.
+func retryAfter(h http.Header) (time.Duration, bool) {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0, false
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0, false
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	t, err := http.ParseTime(v)
+	if err != nil {
+		return 0, false
+	}
+	return max(time.Until(t), 0), true
+}
+
+// jitter adds a random 0-20% (at least up to 1s) on top of d, so clients that
+// received the same Retry-After do not retry in lockstep. It never shortens d.
+func jitter(d time.Duration) time.Duration {
+	spread := max(d/5, time.Second)
+	return d + rand.N(spread)
+}
+
+// sleepCtx waits for d, returning false early if ctx is done first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }

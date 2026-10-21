@@ -40,7 +40,9 @@ func setReportsPrefix(req Req, path, rawPath, prefix string) {
 // only on 403 Forbidden, which the API returns for a prefix outside the
 // organization's region. The first prefix that succeeds is saved for all later
 // /reports requests. Any other error is returned right away, and nothing is
-// saved until a request succeeds.
+// saved until a request succeeds. When every prefix returns 403, the response
+// and error of the main /reports prefix are returned, as the other prefixes
+// are only regional fallbacks.
 func (client *Client) doReports(ctx context.Context, req Req, body []byte) (Res, error) {
 	path, rawPath := req.HttpReq.URL.Path, req.HttpReq.URL.RawPath
 
@@ -54,12 +56,12 @@ func (client *Client) doReports(ctx context.Context, req Req, body []byte) (Res,
 	}
 	defer client.reports.mu.Unlock()
 
-	var res Res
-	var err error
-	for _, prefix := range reportsPrefixes {
+	var mainRes Res
+	var mainErr error
+	for i, prefix := range reportsPrefixes {
 		setReportsPrefix(req, path, rawPath, prefix)
 		log.Printf("[DEBUG] [ReqID: %s] Trying Reports API prefix %s", req.RequestID, prefix)
-		res, err = client.doWithRetries(ctx, req, body)
+		res, err := client.doWithRetries(ctx, req, body)
 		if err == nil {
 			log.Printf("[DEBUG] [ReqID: %s] Using Reports API prefix %s", req.RequestID, prefix)
 			client.reports.prefix = prefix
@@ -68,6 +70,12 @@ func (client *Client) doReports(ctx context.Context, req Req, body []byte) (Res,
 		if res.StatusCode != http.StatusForbidden {
 			return res, err
 		}
+		if i == 0 {
+			mainRes, mainErr = res, err
+		}
 	}
-	return res, err
+
+	// Every prefix returned 403: report the main /reports prefix
+	setReportsPrefix(req, path, rawPath, reportsPrefixes[0])
+	return mainRes, mainErr
 }

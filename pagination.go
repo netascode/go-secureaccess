@@ -13,7 +13,8 @@ import (
 // pages, as a single plain JSON array. A response that is not paginated still
 // yields its items as an array, and an empty collection yields []. A Paginator
 // returns an error when it cannot find the items in the response. The
-// returned Res carries the HTTP status code of the last page requested.
+// returned Res carries the HTTP status code and request ID of the last page
+// requested. All pages share the request ID set by Client.GetAllWithPaginator.
 type Paginator func(ctx context.Context, client *Client, path string, mods ...func(*Req)) (Res, error)
 
 // pathPaginators maps API path prefixes to the Paginator used for them. The
@@ -85,10 +86,14 @@ func (m *arrayMerger) addAll(r gjson.Result) int {
 	return n
 }
 
-// result returns the merged items as a JSON array, with the given HTTP status
-// code.
-func (m *arrayMerger) result(statusCode int) Res {
-	return Res{Result: gjson.Parse("[" + m.sb.String() + "]"), StatusCode: statusCode}
+// result returns the merged items as a JSON array, with the HTTP status code
+// and request ID of last, the last page response.
+func (m *arrayMerger) result(last Res) Res {
+	return Res{
+		Result:     gjson.Parse("[" + m.sb.String() + "]"),
+		StatusCode: last.StatusCode,
+		RequestID:  last.RequestID,
+	}
 }
 
 // OffsetLimitKeyedPagination is a Paginator for responses carrying top-level
@@ -103,12 +108,8 @@ func OffsetLimitKeyedPagination(ctx context.Context, client *Client, path string
 	// Maximum number of items retrieved in a single page request
 	const maxItems = 100
 
-	// Generate Request ID for tracking all get requests under a single ID
-	reqID := generateRequestID(8)
-	mods = append(mods, RequestID(reqID))
-
 	var merged arrayMerger
-	var statusCode int
+	var last Res
 	offset := 0
 	var count, limit int64
 	var key string
@@ -124,7 +125,7 @@ func OffsetLimitKeyedPagination(ctx context.Context, client *Client, path string
 		if err != nil {
 			return raw, err
 		}
-		statusCode = raw.StatusCode
+		last = raw
 
 		// The first page tells where the items are and whether the response
 		// is paginated
@@ -141,7 +142,7 @@ func OffsetLimitKeyedPagination(ctx context.Context, client *Client, path string
 					return raw, nil
 				}
 				if key != "" {
-					return Res{Result: raw.Get(key), StatusCode: raw.StatusCode}, nil
+					return Res{Result: raw.Get(key), StatusCode: raw.StatusCode, RequestID: raw.RequestID}, nil
 				}
 				return raw, fmt.Errorf("response is not an array and has no items array in any of %q fields", itemKeys)
 			}
@@ -161,9 +162,9 @@ func OffsetLimitKeyedPagination(ctx context.Context, client *Client, path string
 		if offset == 0 {
 			// All items are already returned in a single response
 			if count <= limit {
-				return Res{Result: items, StatusCode: raw.StatusCode}, nil
+				return Res{Result: items, StatusCode: raw.StatusCode, RequestID: raw.RequestID}, nil
 			}
-			log.Printf("[DEBUG] [ReqID: %s] Paginated response detected", reqID)
+			log.Printf("[DEBUG] [ReqID: %s] Paginated response detected", raw.RequestID)
 		}
 
 		merged.addAll(items)
@@ -177,7 +178,7 @@ func OffsetLimitKeyedPagination(ctx context.Context, client *Client, path string
 		offset += maxItems
 	}
 
-	return merged.result(statusCode), nil
+	return merged.result(last), nil
 }
 
 // OffsetLimitListPagination is a Paginator for responses that are a plain JSON
@@ -189,12 +190,8 @@ func OffsetLimitListPagination(ctx context.Context, client *Client, path string,
 	// Maximum number of items retrieved in a single page request
 	const maxItems = 1000
 
-	// Generate Request ID for tracking all get requests under a single ID
-	reqID := generateRequestID(8)
-	mods = append(mods, RequestID(reqID))
-
 	var merged arrayMerger
-	var statusCode int
+	var last Res
 	offset := 0
 	for {
 		// Get URL path with offset and limit set
@@ -208,7 +205,7 @@ func OffsetLimitListPagination(ctx context.Context, client *Client, path string,
 		if err != nil {
 			return raw, err
 		}
-		statusCode = raw.StatusCode
+		last = raw
 
 		if !raw.IsArray() {
 			return raw, fmt.Errorf("unexpected non-array response (type %s) at offset %d", raw.Type, offset)
@@ -219,13 +216,13 @@ func OffsetLimitListPagination(ctx context.Context, client *Client, path string,
 			break
 		}
 
-		log.Printf("[DEBUG] [ReqID: %s] Full page at offset %d, requesting next page", reqID, offset)
+		log.Printf("[DEBUG] [ReqID: %s] Full page at offset %d, requesting next page", raw.RequestID, offset)
 
 		// Increase offset to get next bulk of data
 		offset += maxItems
 	}
 
-	return merged.result(statusCode), nil
+	return merged.result(last), nil
 }
 
 // PageLimitKeyedPagination is a Paginator for responses carrying the items in a
@@ -239,12 +236,8 @@ func PageLimitKeyedPagination(ctx context.Context, client *Client, path string, 
 	// Maximum number of items retrieved in a single page request (max is 100)
 	const maxItems = 100
 
-	// Generate Request ID for tracking all get requests under a single ID
-	reqID := generateRequestID(8)
-	mods = append(mods, RequestID(reqID))
-
 	var merged arrayMerger
-	var statusCode int
+	var last Res
 	var key string
 	var collected int64
 	for page := 1; ; page++ {
@@ -259,7 +252,7 @@ func PageLimitKeyedPagination(ctx context.Context, client *Client, path string, 
 		if err != nil {
 			return raw, err
 		}
-		statusCode = raw.StatusCode
+		last = raw
 
 		// Detect the field carrying the items on the first page
 		if page == 1 {
@@ -283,10 +276,10 @@ func PageLimitKeyedPagination(ctx context.Context, client *Client, path string, 
 			break
 		}
 
-		log.Printf("[DEBUG] [ReqID: %s] Full page %d, requesting next page", reqID, page)
+		log.Printf("[DEBUG] [ReqID: %s] Full page %d, requesting next page", raw.RequestID, page)
 	}
 
-	return merged.result(statusCode), nil
+	return merged.result(last), nil
 }
 
 // PageLimitMapPagination is a Paginator for responses that are a JSON object
@@ -299,12 +292,8 @@ func PageLimitMapPagination(ctx context.Context, client *Client, path string, mo
 	// Maximum number of items retrieved in a single page request
 	const maxItems = 100
 
-	// Generate Request ID for tracking all get requests under a single ID
-	reqID := generateRequestID(8)
-	mods = append(mods, RequestID(reqID))
-
 	var merged arrayMerger
-	var statusCode int
+	var last Res
 	for page := 1; ; page++ {
 		// Get URL path with page and limit set
 		urlPath, err := pathWithPage(path, page, maxItems)
@@ -317,7 +306,7 @@ func PageLimitMapPagination(ctx context.Context, client *Client, path string, mo
 		if err != nil {
 			return raw, err
 		}
-		statusCode = raw.StatusCode
+		last = raw
 
 		// An empty list means there are no more items
 		if raw.IsArray() && len(raw.Array()) == 0 {
@@ -334,10 +323,10 @@ func PageLimitMapPagination(ctx context.Context, client *Client, path string, mo
 			break
 		}
 
-		log.Printf("[DEBUG] [ReqID: %s] Full page %d, requesting next page", reqID, page)
+		log.Printf("[DEBUG] [ReqID: %s] Full page %d, requesting next page", raw.RequestID, page)
 	}
 
-	return merged.result(statusCode), nil
+	return merged.result(last), nil
 }
 
 // PageLimitListPagination is a Paginator for responses that are a plain JSON
@@ -349,12 +338,8 @@ func PageLimitListPagination(ctx context.Context, client *Client, path string, m
 	// Maximum number of items retrieved in a single page request
 	const maxItems = 100
 
-	// Generate Request ID for tracking all get requests under a single ID
-	reqID := generateRequestID(8)
-	mods = append(mods, RequestID(reqID))
-
 	var merged arrayMerger
-	var statusCode int
+	var last Res
 	for page := 1; ; page++ {
 		// Get URL path with page and limit set
 		urlPath, err := pathWithPage(path, page, maxItems)
@@ -367,7 +352,7 @@ func PageLimitListPagination(ctx context.Context, client *Client, path string, m
 		if err != nil {
 			return raw, err
 		}
-		statusCode = raw.StatusCode
+		last = raw
 
 		if !raw.IsArray() {
 			return raw, fmt.Errorf("unexpected non-array response (type %s) on page %d", raw.Type, page)
@@ -378,8 +363,8 @@ func PageLimitListPagination(ctx context.Context, client *Client, path string, m
 			break
 		}
 
-		log.Printf("[DEBUG] [ReqID: %s] Full page %d, requesting next page", reqID, page)
+		log.Printf("[DEBUG] [ReqID: %s] Full page %d, requesting next page", raw.RequestID, page)
 	}
 
-	return merged.result(statusCode), nil
+	return merged.result(last), nil
 }

@@ -13,4 +13,8 @@ type Res struct {
 	// StatusCode is the HTTP status code of the response, or 0 if no
 	// response was received.
 	StatusCode int
+
+	// RequestID is the unique identifier of the request this response
+	// belongs to.
+	RequestID string
 }
