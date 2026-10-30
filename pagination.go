@@ -24,10 +24,14 @@ var pathPaginators = map[string]Paginator{
 	"/policies/v2/":                                      OffsetLimitListPagination,
 	"/policies/v2/objects/":                              OffsetLimitKeyedPagination,
 	"/policies/v2/privateResourceGroups":                 OffsetLimitKeyedPagination,
+	"/policies/v2/doNotDecryptLists":                     PageLimitListPagination,
 	"/policies/v2/destinationlists":                      PageLimitKeyedPagination,
 	"/policies/v2/applicationCategories":                 PageLimitMapPagination,
 	"/policies/v2/applicationCategories?optionalFields=": PageLimitListPagination,
-	"": OffsetLimitKeyedPagination,
+	"/deployments/v2/sites":                              PageLimitListPagination,
+	"/deployments/v2/networks":                           PageLimitListPagination,
+	"/reports/v2/categories":                             KeyedNoPagination,
+	"":                                                   OffsetLimitKeyedPagination,
 }
 
 // pathPaginator returns the Paginator registered for the longest prefix of
@@ -367,4 +371,20 @@ func PageLimitListPagination(ctx context.Context, client *Client, path string, m
 	}
 
 	return merged.result(last), nil
+}
+
+// KeyedNoPagination is a Paginator that returns all items in a single request without any paging.
+func KeyedNoPagination(ctx context.Context, client *Client, path string, mods ...func(*Req)) (Res, error) {
+
+	// Execute query
+	raw, err := client.get(ctx, path, mods...)
+	if err != nil {
+		return raw, err
+	}
+	key := itemsKey(raw)
+	if key == "" {
+		return raw, fmt.Errorf("[DEBUG] [ReqID: %s] no items array found in any of %q fields", raw.RequestID, itemKeys)
+	}
+	raw.Result = raw.Result.Get(key)
+	return raw, nil
 }
