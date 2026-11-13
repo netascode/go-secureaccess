@@ -28,6 +28,13 @@ var pathPaginators = map[string]Paginator{
 	"/policies/v2/destinationlists":                      PageLimitKeyedPagination,
 	"/policies/v2/applicationCategories":                 PageLimitMapPagination,
 	"/policies/v2/applicationCategories?optionalFields=": PageLimitListPagination,
+	"/policies/v2/landerSettings":                        ListNoPagination,
+	"/policies/v2/enterpriseApplications":                ListNoPagination,
+	"/policies/v2/threatCategories":                      ListNoPagination,
+	"/policies/v2/dlp/custom/dataIdentifiers":            OffsetLikePageLimitListPagination,
+	"/policies/v2/dlp/builtIn/dataIdentifiers":           OffsetLikePageLimitListPagination,
+	"/policies/v2/dlp/builtIn/classifications":           ListNoPagination,
+	"/policies/v2/dlp/custom/classifications":            ListNoPagination,
 	"/deployments/v2/sites":                              PageLimitListPagination,
 	"/deployments/v2/networks":                           PageLimitListPagination,
 	"/reports/v2/categories":                             KeyedNoPagination,
@@ -177,6 +184,8 @@ func OffsetLimitKeyedPagination(ctx context.Context, client *Client, path string
 		if count <= int64(offset+maxItems) {
 			break
 		}
+
+		log.Printf("[DEBUG] [ReqID: %s] Non-empty page at offset %d, requesting next page", raw.RequestID, offset)
 
 		// Increase offset to get next bulk of data
 		offset += maxItems
@@ -387,4 +396,50 @@ func KeyedNoPagination(ctx context.Context, client *Client, path string, mods ..
 	}
 	raw.Result = raw.Result.Get(key)
 	return raw, nil
+}
+
+// ListNoPagination is a Paginator that returns all items in a single request without any paging.
+func ListNoPagination(ctx context.Context, client *Client, path string, mods ...func(*Req)) (Res, error) {
+
+	// Execute query
+	return client.get(ctx, path, mods...)
+}
+
+// OffsetLikePageLimitListPagination is a Paginator that behaves like PageLimitListPagination,
+// but uses on offset parameter, where in fact this behaves like a page. Pages are
+// requested until an empty page is returned.
+func OffsetLikePageLimitListPagination(ctx context.Context, client *Client, path string, mods ...func(*Req)) (Res, error) {
+
+	// Maximum number of items retrieved in a single page request
+	const maxItems = 100
+
+	var merged arrayMerger
+	var last Res
+	for offset := 0; ; offset += 1 {
+		// Get URL path with offset and limit set
+		urlPath, err := pathWithOffset(path, offset, maxItems)
+		if err != nil {
+			return Res{}, err
+		}
+
+		// Execute query
+		raw, err := client.get(ctx, urlPath, mods...)
+		if err != nil {
+			return raw, err
+		}
+		last = raw
+
+		if !raw.IsArray() {
+			return raw, fmt.Errorf("unexpected non-array response (type %s) at offset %d", raw.Type, offset)
+		}
+
+		// Only an empty page marks the end
+		if merged.addAll(raw.Result) == 0 {
+			break
+		}
+
+		log.Printf("[DEBUG] [ReqID: %s] Non-empty page at offset %d, requesting next page", raw.RequestID, offset)
+	}
+
+	return merged.result(last), nil
 }
