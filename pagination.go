@@ -35,6 +35,7 @@ var pathPaginators = map[string]Paginator{
 	"/policies/v2/dlp/builtIn/dataIdentifiers":           OffsetLikePageLimitListPagination,
 	"/policies/v2/dlp/builtIn/classifications":           ListNoPagination,
 	"/policies/v2/dlp/custom/classifications":            ListNoPagination,
+	"/policies/v2/dlp/aiGuardrails/dataIdentifiers":      ListNoPagination,
 	"/deployments/v2/sites":                              PageLimitListPagination,
 	"/deployments/v2/networks":                           PageLimitListPagination,
 	"/reports/v2/categories":                             KeyedNoPagination,
