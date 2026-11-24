@@ -38,6 +38,7 @@ var pathPaginators = map[string]Paginator{
 	"/policies/v2/dlp/aiGuardrails/dataIdentifiers":      ListNoPagination,
 	"/deployments/v2/sites":                              PageLimitListPagination,
 	"/deployments/v2/networks":                           PageLimitListPagination,
+	"/deployments/v2/ztna/":                              CursorLimitKeyedPagination,
 	"/reports/v2/categories":                             KeyedNoPagination,
 	"":                                                   OffsetLimitKeyedPagination,
 }
@@ -378,6 +379,69 @@ func PageLimitListPagination(ctx context.Context, client *Client, path string, m
 		}
 
 		log.Printf("[DEBUG] [ReqID: %s] Full page %d, requesting next page", raw.RequestID, page)
+	}
+
+	return merged.result(last), nil
+}
+
+// CursorLimitKeyedPagination is a Paginator for responses carrying the items in
+// a top-level array, whose name is detected on the first page from itemKeys,
+// and the cursor of the next page in a top-level "cursor" field. It requests
+// pages of maxItems items with the cursor and limit query parameters, starting
+// without a cursor, until a response has no cursor or an empty one, and merges
+// their items into a single plain array. When no items array is found, or the
+// server returns the same cursor twice, an error is returned.
+func CursorLimitKeyedPagination(ctx context.Context, client *Client, path string, mods ...func(*Req)) (Res, error) {
+	// Maximum number of items retrieved in a single page request
+	const maxItems = 100
+
+	var merged arrayMerger
+	var last Res
+	var key string
+	seen := map[string]bool{}
+	cursor := ""
+	for page := 1; ; page++ {
+		// Get URL path with cursor and limit set
+		urlPath, err := pathWithCursor(path, cursor, maxItems)
+		if err != nil {
+			return Res{}, err
+		}
+
+		// Execute query
+		raw, err := client.get(ctx, urlPath, mods...)
+		if err != nil {
+			return raw, err
+		}
+		last = raw
+
+		// Detect the field carrying the items on the first page
+		if page == 1 {
+			key = itemsKey(raw)
+			if key == "" {
+				return raw, fmt.Errorf("no items array found in any of %q fields", itemKeys)
+			}
+		}
+
+		items := raw.Get(key)
+		if !items.IsArray() {
+			return raw, fmt.Errorf("unexpected non-array %q field (type %s) on page %d", key, items.Type, page)
+		}
+
+		merged.addAll(items)
+
+		// A missing or empty cursor marks the last page
+		cursor = raw.Get("cursor").String()
+		if cursor == "" {
+			break
+		}
+
+		// Guard against a server looping over the same pages
+		if seen[cursor] {
+			return raw, fmt.Errorf("cursor %q repeated on page %d", cursor, page)
+		}
+		seen[cursor] = true
+
+		log.Printf("[DEBUG] [ReqID: %s] Cursor %q on page %d, requesting next page", raw.RequestID, cursor, page)
 	}
 
 	return merged.result(last), nil

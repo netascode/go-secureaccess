@@ -94,6 +94,27 @@ func pathWithPage(path string, page, limit int) (string, error) {
 	return u.String(), nil
 }
 
+// pathWithCursor returns path with the cursor and limit query parameters set,
+// replacing them if they are already present. An empty cursor removes the
+// cursor parameter, requesting the first page.
+func pathWithCursor(path, cursor string, limit int) (string, error) {
+	u, err := url.Parse(path)
+	if err != nil {
+		return path, err
+	}
+
+	q := u.Query()
+	if cursor == "" {
+		q.Del("cursor")
+	} else {
+		q.Set("cursor", cursor)
+	}
+	q.Set("limit", strconv.Itoa(limit))
+	u.RawQuery = q.Encode()
+
+	return u.String(), nil
+}
+
 // retryAfter parses the Retry-After header, given either as delay-seconds or as
 // an HTTP-date. It reports false if the header is missing or malformed.
 func retryAfter(h http.Header) (time.Duration, bool) {
